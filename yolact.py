@@ -1684,7 +1684,7 @@ class Yolact(nn.Module):
 
         if cfg.flow is not None:
             with timer.env('fpn'):
-                assert type(extras) == dict
+               # assert type(extras) == dict
                 if extras["backbone"] == "full":
                     outs = [outs[i] for i in cfg.backbone.selected_layers]
                     outs_fpn_phase_1_wrapper = self.fpn_phase_1(*outs)

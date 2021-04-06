@@ -19,7 +19,7 @@ def postprocess(det_output, w, h, batch_idx=0, interpolation_mode='bilinear',
     accounting for all the possible configuration settings.
 
     Args:
-        - det_output: The lost of dicts that Detect outputs.
+        - det_output: The list of dicts that Detect outputs.
         - w: The real with of the image.
         - h: The real height of the image.
         - batch_idx: If you have multiple images for this batch, the image's index in the batch.
@@ -35,7 +35,7 @@ def postprocess(det_output, w, h, batch_idx=0, interpolation_mode='bilinear',
     dets = det_output[batch_idx]
     
     if dets is None:
-        return [torch.Tensor()] * 4 # Warning, this is 4 copies of the same thing
+        return [torch.Tensor()] * 4  # Warning, this is 4 copies of the same thing
 
     if score_threshold > 0:
         keep = dets['score'] > score_threshold
@@ -59,7 +59,7 @@ def postprocess(det_output, w, h, batch_idx=0, interpolation_mode='bilinear',
         boxes = center_size(boxes)
         s_w, s_h = (r_w/cfg.max_size, r_h/cfg.max_size)
         
-        not_outside = ((boxes[:, 0] > s_w) + (boxes[:, 1] > s_h)) < 1 # not (a or b)
+        not_outside = ((boxes[:, 0] > s_w) + (boxes[:, 1] > s_h)) < 1    # not (a or b)
         for k in dets:
             if k != 'proto':
                 dets[k] = dets[k][not_outside]
