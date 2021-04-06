@@ -140,6 +140,9 @@ dataset_base = Config({
     # Training images and annotations
     'train_images': './data/coco/images/',
     'train_info':   'path_to_annotation_file',
+
+    # Calibration image folder for TensorRT INT8 conversion.
+    'calib_images': './data/coco/calib_images/',
     
     # Validation images and annotations.
     'valid_images': './data/coco/images/',
@@ -210,6 +213,11 @@ youtube_vis_dataset = dataset_base.copy({
     'train_images': './data/YoutubeVIS/train_all_frames/JPEGImages/',
     'use_all_frames': False,
 
+    # Calibration image folder for TensorRT INT8 conversion.
+    # Because we need two frames (prev, next) to estimate flows and calibrate the warping module, we need to specify a parent folder for calibration images, and two sub-folders for previous and next frames correspondingly.
+    # Use colon(:) to split folder (sub-folders).
+    'calib_images': './data/YoutubeVIS/calib_images/:prev:next',
+
     'frame_offset_lb': 1,
     'frame_offset_ub': 4,
     'frame_offset_multiplier': 1,
@@ -217,9 +225,6 @@ youtube_vis_dataset = dataset_base.copy({
 
     'valid_info': './data/YoutubeVIS/annotations/valid.v4.json',
     'valid_images': './data/YoutubeVIS/valid_all_frames/v4/',
-
-    'train_medium_motion': './data/YoutubeVIS/annotations/train.v4.medium.json',
-    'train_large_motion': './data/YoutubeVIS/annotations/train.v4.large.json',
 
     'images_per_video': 5,
     'is_video': True
@@ -487,18 +492,11 @@ fpn_base = Config({
 
 # ------------------------ FLOW DEFAULTS ------------------------ #
 flow_base = Config({
-    'selected_backbone': 0,
-    'layer_features': [128, 128, 96, 64, 32],
-    'patch_size': 3,
     'encode_layers': [[4, 1], [2], [4]],
     'encode_channels': 256,
     'fine_tune_layers': None,
-    'interpolate_upsample': False,
-    'use_computed_P3': True,
     'warp_layers': "P4P5",
-    'flow_direct_downsample': False,
     'use_spa': False,
-    'use_spa_both': False,
     'use_normalized_spa': False,
     'use_shuffle_cat': False,
     'num_groups': 1,
@@ -507,12 +505,6 @@ flow_base = Config({
     'reduce_channels': [],
     'warp_mode': 'none',
     'flow_layer': 'each',
-    'warp_target': 'feature',
-    'pred_heads_no_conflict': False,
-    'proto_net_no_conflict': False,
-    'fpn_no_conflict': False,
-    'warp_flow_layer': 'top',
-    'correlation': 'external',
     'base_backward': True,
     'feature_matching_loss': None,
     'fm_loss_loc': 'L',
@@ -793,6 +785,8 @@ yolact_base_config = coco_base_config.copy({
     'torch2trt_spa_int8': False,
     'torch2trt_flow_net': False,
     'torch2trt_flow_net_int8': False,
+
+    'use_tensorrt_safe_mode': False,
 })
 
 yolact_edge_config = yolact_base_config.copy({
@@ -843,23 +837,32 @@ yolact_edge_vid_config = yolact_edge_config.copy({
         'num_groups': 1,
         'use_shuffle_cat': False,
         'base_backward': True,
-        'fine_tune_layers': 'flow_net,spa,fpn_phase_2,proto_net,prediction_layers,semantic_seg_conv',
+        'fine_tune_layers': 'flow_net,flow_net_pre_convs,spa,fpn_phase_2,proto_net,prediction_layers,semantic_seg_conv',
         'selected_layers': [1, 2],
         'warp_mode': 'flow',
         'model': 'mini',
         'use_pseudo_gt_flow_loss': False,
         'feature_matching_loss': 'cosine',
-        'use_computed_P3': True,
         'use_spa': True,
         'fm_loss_loc': 'L+P',
+    })
+})
+
+yolact_edge_vid_minimal_config = yolact_edge_vid_config.copy({
+    'name': 'yolact_edge_vid_minimal',
+    'torch2trt_spa': False,
+    'flow': yolact_edge_vid_config.flow.copy({
+        'fine_tune_layers': 'flow_net,flow_net_pre_convs,fpn_phase_2,proto_net,prediction_layers,semantic_seg_conv',
+        'use_spa': False,
+        'feature_matching_loss': None,
     })
 })
 
 yolact_edge_vid_trainflow_config = yolact_edge_vid_config.copy({
     'name': 'yolact_edge_vid_trainflow',
     'dataset': flying_chairs_dataset,
-    'lr': 1e-3,
-    'max_iter': 750000,
+    'lr': 2e-4,
+    'max_iter': 400000,
     'flow': yolact_edge_vid_config.flow.copy({
         'train_flow': True,
         'base_backward': False,
@@ -880,6 +883,7 @@ yolact_edge_youtubevis_config = yolact_edge_vid_config.copy({
     'lr': 5e-4,
     'lr_schedule': 'cosine',
     'max_iter': 500000,
+    'augment_expand': True,
     'flow': yolact_edge_vid_config.flow.copy({
         'warp_mode': 'none',
         'fine_tune_layers': None,

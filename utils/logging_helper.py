@@ -27,9 +27,18 @@ class _ColorfulFormatter(logging.Formatter):
         return prefix + " " + log
 
 
-def setup_logger(name="yolact", output=None, distributed_rank=0, abbrev_name=None):
+def log_once(obj, msg_key, name, message, level=logging.WARNING, *args, **kwargs):
+    if getattr(obj, "logged_" + msg_key, False):
+        return
+    
+    setattr(obj, "logged_" + msg_key, True)
     logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)
+    logger.log(level, message, *args, **kwargs)
+
+
+def setup_logger(name="yolact", output=None, distributed_rank=0, abbrev_name=None, logging_level=logging.DEBUG):
+    logger = logging.getLogger(name)
+    logger.setLevel(logging_level)
     logger.propagate = False
 
     if abbrev_name is None:
@@ -37,7 +46,7 @@ def setup_logger(name="yolact", output=None, distributed_rank=0, abbrev_name=Non
 
     if distributed_rank == 0:
         ch = logging.StreamHandler(stream=sys.stdout)
-        ch.setLevel(logging.DEBUG)
+        ch.setLevel(logging_level)
 
         formatter = _ColorfulFormatter(
             colored("[%(asctime)s %(name)s]: ", "green") + "%(message)s",

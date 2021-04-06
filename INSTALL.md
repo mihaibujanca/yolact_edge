@@ -28,7 +28,8 @@
    ```Shell
    # Cython needs to be installed before pycocotools
    pip install cython
-   pip install opencv-python pillow pycocotools matplotlib
+   pip install opencv-python pillow matplotlib
+   pip install git+https://github.com/haotian-liu/cocoapi.git#"egg=pycocotools&subdirectory=PythonAPI"
    pip install GitPython termcolor tensorboard
    ```
  - Clone this repository and enter it:
@@ -44,6 +45,7 @@
    ```Shell
    sh data/scripts/COCO_test.sh
    ```
+ - To evaluate YolactEdge with TensorRT INT8 calibration you need to download the calibration dataset (this avoids having to download the entire COCO/YouTube-VIS dataset and their annotations) for [COCO](https://drive.google.com/file/d/15jyd5CRJxNiA41UMjGbaSnmaytfeILfI/view?usp=sharing) and [YouTube VIS](https://drive.google.com/file/d/1KT79KHUECdV0fIkBc5OTSHCf13FXg-aO/view?usp=sharing). Store the `calib_images` folder under its corresponding dataset folder as shown in the example below. Note that our best models use INT8 calibration so this step is highly advised.
  - If you'd like to train YolactEdge on YouTube VIS, download the [YouTube VIS dataset](https://youtube-vos.org/dataset/) (you need to register to download) and our training/validation split [annotations](https://drive.google.com/drive/folders/1hFM-BLlsufO-C99QIDSBkD2JR5qVMfx2?usp=sharing) into `./data/YoutubeVIS`.
    - If you'd like to train jointly with COCO, download the COCO dataset and the 2014/2017 annotations using the script above.
    - If you'd like to train on all video frames, download the [FlyingChairs dataset](https://lmb.informatik.uni-freiburg.de/resources/datasets/FlyingChairs.en.html#flyingchairs) into `./data/FlyingChairs`.
@@ -52,12 +54,14 @@
     ./data
     ├── coco
     │   ├── annotations
+    │   ├── calib_images
     │   └── images
     ├── FlyingChairs
     │   ├── data
     │   └── train_val.txt
     └── YoutubeVIS
         ├── annotations
+        ├── calib_images
         ├── JPEGImages
         └── train_all_frames
             └── JPEGImages

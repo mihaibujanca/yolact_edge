@@ -6,7 +6,8 @@ import numpy as np
 from functools import partial
 from itertools import product, chain
 from math import sqrt
-from typing import List, Tuple
+from typing import List, Tuple, Optional
+from torch import Tensor
 
 from data.config import cfg, mask_type
 from layers import Detect
@@ -36,7 +37,6 @@ torch.cuda.current_device()
 
 # As of March 10, 2019, Pytorch DataParallel still doesn't support JIT Script Modules
 use_jit = False if use_torch2trt else torch.cuda.device_count() <= 1
-NoneTensor = None if use_torch2trt else torch.Tensor()
 
 ScriptModuleWrapper = torch.jit.ScriptModule if use_jit else nn.Module
 script_method_wrapper = torch.jit.script_method if use_jit else lambda fn, _rcn=None: fn
@@ -187,56 +187,7 @@ class PredictionModule(nn.Module):
         self.priors = None
         self.last_conv_size = None
 
-    def to_tensorrt(self, int8_mode=False):
-        """Converts the bbox, conf, and mask layer of the PredictionModule
-           into TRTModules.
-        """
-
-        # Each PredictionModule takes a particular input shape.
-        # Torch2TRT optimizes based on the input shape so we need to
-        # make sure that we feed it the same shape that it will receive
-        # during testing phase.
-        input_sizes = [
-                (1, 256, 69, 69),
-                (1, 256, 35, 35),
-                (1, 256, 18, 18),
-                (1, 256, 9, 9),
-                (1, 256, 5, 5),
-        ]
-
-        x = torch.ones(input_sizes[self.index]).cuda()
-
-        if int8_mode:
-            trt_fn = partial(torch2trt, int8_mode=True, strict_type_constraints=True)
-        else:
-            trt_fn = partial(torch2trt, fp16_mode=True, strict_type_constraints=True)
-
-        if self.index == 0 and cfg.share_prediction_module:
-            self.upfeature_old  = self.upfeature
-            self.bbox_layer_old = self.bbox_layer
-            self.conf_layer_old = self.conf_layer
-            self.mask_layer_old = self.mask_layer
-
-            self.upfeature  = trt_fn(self.upfeature, [x])
-            self.bbox_layer = trt_fn(self.bbox_layer, [x])
-            self.conf_layer = trt_fn(self.conf_layer, [x])
-            self.mask_layer = trt_fn(self.mask_layer, [x])
-        elif self.index > 0 and self.parent is not None and cfg.share_prediction_module:
-            self.bbox_extra = self.parent[0].bbox_extra
-            self.conf_extra = self.parent[0].conf_extra
-            self.mask_extra = self.parent[0].mask_extra
-
-            self.upfeature  = trt_fn(self.parent[0].upfeature_old, [x])
-            self.bbox_layer = trt_fn(self.parent[0].bbox_layer_old, [x])
-            self.conf_layer = trt_fn(self.parent[0].conf_layer_old, [x])
-            self.mask_layer = trt_fn(self.parent[0].mask_layer_old, [x])
-
-            self.parent = [None]
-        else:
-            raise NotImplementedError("to_tensorrt doesn't currently work when we're not"
-                                      "sharing the prediction module")
-
-    def forward(self, x, extras=None):
+    def forward(self, x):
         """
         Args:
             - x: The convOut from a layer in the backbone network
@@ -250,9 +201,6 @@ class PredictionModule(nn.Module):
         """
         # In case we want to use another module's layers
         src = self if self.parent[0] is None else self.parent[0]
-
-        if extras is not None:
-            assert type(extras) == dict
         
         conv_h = x.size(2)
         conv_w = x.size(3)
@@ -277,15 +225,6 @@ class PredictionModule(nn.Module):
 
         bbox = src.bbox_layer(bbox_x).permute(0, 2, 3, 1).contiguous().view(x.size(0), -1, 4)
         conf = src.conf_layer(conf_x).permute(0, 2, 3, 1).contiguous().view(x.size(0), -1, self.num_classes)
-
-        if extras is not None and 'conf_hist' in extras:
-            conf_hist = extras['conf_hist'].copy()
-            _, _, h, w = bbox_x.size()
-            conf_spatial = conf.view(x.size(0), h, w, -1).contiguous().permute(0, 3, 1, 2)
-            conf_hist.append(conf_spatial)
-            stacked_conf = torch.stack(conf_hist, dim=0)
-            conf = torch.mean(stacked_conf, dim=0)
-            conf = conf.permute(0, 2, 3, 1).contiguous().view(x.size(0), -1, self.num_classes)
 
         if cfg.eval_mask_branch:
             mask = src.mask_layer(mask_x).permute(0, 2, 3, 1).contiguous().view(x.size(0), -1, self.mask_dim)
@@ -362,83 +301,10 @@ class PredictionModule(nn.Module):
         return self.priors
 
 
-class PredictionModuleTRT(nn.Module):
-    """
-    The (c) prediction module adapted from DSSD:
-    https://arxiv.org/pdf/1701.06659.pdf
-
-    Note that this is slightly different to the module in the paper
-    because the Bottleneck block actually has a 3x3 convolution in
-    the middle instead of a 1x1 convolution. Though, I really can't
-    be arsed to implement it myself, and, who knows, this might be
-    better.
-
-    Args:
-        - in_channels:   The input feature size.
-        - out_channels:  The output feature size (must be a multiple of 4).
-        - aspect_ratios: A list of lists of priorbox aspect ratios (one list per scale).
-        - scales:        A list of priorbox scales relative to this layer's convsize.
-                         For instance: If this layer has convouts of size 30x30 for
-                                       an image of size 600x600, the 'default' (scale
-                                       of 1) for this layer would produce bounding
-                                       boxes with an area of 20x20px. If the scale is
-                                       .5 on the other hand, this layer would consider
-                                       bounding boxes with area 10x10px, etc.
-        - parent:        If parent is a PredictionModule, this module will use all the layers
-                         from parent instead of from this module.
-    """
+class PredictionModuleTRT(PredictionModule):
     
     def __init__(self, in_channels, out_channels=1024, aspect_ratios=[[1]], scales=[1], parent=None, index=0):
-        super().__init__()
-
-        self.num_classes = cfg.num_classes
-        self.mask_dim    = cfg.mask_dim
-        self.num_priors  = sum(len(x) for x in aspect_ratios)
-        self.parent      = [parent] # Don't include this in the state dict
-        self.index       = index
-
-        if cfg.mask_proto_prototypes_as_features:
-            in_channels += self.mask_dim
-        
-        if parent is None:
-            if cfg.extra_head_net is None:
-                out_channels = in_channels
-            else:
-                self.upfeature, out_channels = make_net(in_channels, cfg.extra_head_net)
-
-            if cfg.use_prediction_module:
-                self.block = Bottleneck(out_channels, out_channels // 4)
-                self.conv = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=True)
-                self.bn = nn.BatchNorm2d(out_channels)
-
-            self.bbox_layer = nn.Conv2d(out_channels, self.num_priors * 4,                **cfg.head_layer_params)
-            self.conf_layer = nn.Conv2d(out_channels, self.num_priors * self.num_classes, **cfg.head_layer_params)
-            self.mask_layer = nn.Conv2d(out_channels, self.num_priors * self.mask_dim,    **cfg.head_layer_params)
-
-            if cfg.use_instance_coeff:
-                self.inst_layer = nn.Conv2d(out_channels, self.num_priors * cfg.num_instance_coeffs, **cfg.head_layer_params)
-            
-            # What is this ugly lambda doing in the middle of all this clean prediction module code?
-            def make_extra(num_layers):
-                if num_layers == 0:
-                    return lambda x: x
-                else:
-                    # Looks more complicated than it is. This just creates an array of num_layers alternating conv-relu
-                    return nn.Sequential(*sum([[
-                        nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-                        nn.ReLU(inplace=True)
-                    ] for _ in range(num_layers)], []))
-
-            self.bbox_extra, self.conf_extra, self.mask_extra = [make_extra(x) for x in cfg.extra_layers]
-            
-            if cfg.mask_type == mask_type.lincomb and cfg.mask_proto_coeff_gate:
-                self.gate_layer = nn.Conv2d(out_channels, self.num_priors * self.mask_dim, kernel_size=3, padding=1)
-
-        self.aspect_ratios = aspect_ratios
-        self.scales = scales
-
-        self.priors = None
-        self.last_conv_size = None
+        super().__init__(in_channels, out_channels, aspect_ratios, scales, parent, index)
 
         if cfg.mask_proto_coeff_activation == torch.tanh:
             self.activation_func = nn.Tanh()
@@ -507,55 +373,7 @@ class PredictionModuleTRT(nn.Module):
                     gate = self.gate_layer(x).permute(0, 2, 3, 1).contiguous().view(x.size(0), -1, self.mask_dim)
                     mask = mask * torch.sigmoid(gate)
 
-        # preds = { 'loc': bbox, 'conf': conf, 'mask': mask, 'priors': priors }
-
-        # if cfg.use_instance_coeff:
-        #     preds['inst'] = inst
-
         return bbox, conf, mask
-        
-        # return preds
-    
-    def make_priors(self, conv_h, conv_w):
-        """ Note that priors are [x,y,width,height] where (x,y) is the center of the box. """
-        
-        with timer.env('makepriors'):
-            if self.last_conv_size != (conv_w, conv_h):
-                prior_data = []
-
-                # Iteration order is important (it has to sync up with the convout)
-                for j, i in product(range(conv_h), range(conv_w)):
-                    # +0.5 because priors are in center-size notation
-                    x = (i + 0.5) / conv_w
-                    y = (j + 0.5) / conv_h
-                    
-                    for scale, ars in zip(self.scales, self.aspect_ratios):
-                        for ar in ars:
-                            if not cfg.backbone.preapply_sqrt:
-                                ar = sqrt(ar)
-
-                            if cfg.backbone.use_pixel_scales:
-                                if type(cfg.max_size) == tuple:
-                                    width, height = cfg.max_size
-                                    w = scale * ar / width
-                                    h = scale / ar / height
-                                else:
-                                    w = scale * ar / cfg.max_size
-                                    h = scale / ar / cfg.max_size
-                            else:
-                                w = scale * ar / conv_w
-                                h = scale / ar / conv_h
-                            
-                            # This is for backward compatability with a bug where I made everything square by accident
-                            if cfg.backbone.use_square_anchors:
-                                h = w
-
-                            prior_data += [x, y, w, h]
-                
-                self.priors = torch.Tensor(prior_data).view(-1, 4)
-                self.last_conv_size = (conv_w, conv_h)
-        
-        return self.priors
 
 
 def conv_bn_lrelu(in_features, out_features, kernel_size=3, stride=1, padding=1, dilation=1, batch_norm=True):
@@ -733,11 +551,11 @@ class PredictionModuleTRTWrapper(nn.Module):
         pred_layer_w = pred_layer.parent[0] if pred_layer.parent[0] is not None else pred_layer
         self.pred_layer.load_state_dict(pred_layer_w.state_dict())
 
-    def to_tensorrt(self, int8_mode=False, calibration_dataset=None):
+    def to_tensorrt(self, int8_mode=False, calibration_dataset=None, batch_size=1):
         if int8_mode:
-            trt_fn = partial(torch2trt, int8_mode=True, int8_calib_dataset=calibration_dataset, strict_type_constraints=True)
+            trt_fn = partial(torch2trt, int8_mode=True, int8_calib_dataset=calibration_dataset, strict_type_constraints=True, max_batch_size=batch_size)
         else:
-            trt_fn = partial(torch2trt, fp16_mode=True, strict_type_constraints=True)
+            trt_fn = partial(torch2trt, fp16_mode=True, strict_type_constraints=True, max_batch_size=batch_size)
 
         input_sizes = [
                 (1, 256, 69, 69),
@@ -854,10 +672,11 @@ def build_flow_convs(encode_layers, in_features, out_features, stride=1, groups=
 
 
 class FlowNetMini(ScriptModuleWrapper):
-    __constants__ = ['interpolation_mode', 'skip_flow']
+    __constants__ = ['interpolation_mode', 'use_shuffle_cat', 'skip_flow']
     def __init__(self, in_features):
         super().__init__()
         self.interpolation_mode = cfg.fpn.interpolation_mode
+        self.use_shuffle_cat = cfg.flow.use_shuffle_cat
 
         self.conv1 = build_flow_convs(cfg.flow.encode_layers[0], in_features, cfg.flow.encode_channels, groups=cfg.flow.num_groups)
         self.conv2 = build_flow_convs(cfg.flow.encode_layers[1], cfg.flow.encode_channels, cfg.flow.encode_channels * 2, stride=2)
@@ -887,7 +706,10 @@ class FlowNetMini(ScriptModuleWrapper):
     def forward(self, target_feat, source_feat):
         preds: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
-        concat0 = shuffle_cat(target_feat, source_feat)
+        if self.use_shuffle_cat:
+            concat0 = shuffle_cat(target_feat, source_feat)
+        else:
+            concat0 = torch.cat((target_feat, source_feat), dim=1)
 
         out_conv1 = self.conv1(concat0)
         out_conv2 = self.conv2(out_conv1)
@@ -992,7 +814,7 @@ class FlowNetMiniTRT(ScriptModuleWrapper):
 
 
 class SPA(ScriptModuleWrapper):
-    __constants__ = ['interpolation_mode', 'refine_convs', 'use_normalized_spa']
+    __constants__ = ['interpolation_mode', 'use_normalized_spa']
 
     def __init__(self, num_layers):
         super().__init__()
@@ -1033,7 +855,7 @@ class SPA(ScriptModuleWrapper):
 
 
 class FPN_phase_1(ScriptModuleWrapper):
-    __constants__ = ['interpolation_mode', 'lat_layers']
+    __constants__ = ['interpolation_mode']
 
     def __init__(self, in_channels):
         super().__init__()
@@ -1048,7 +870,8 @@ class FPN_phase_1(ScriptModuleWrapper):
         self.interpolation_mode = cfg.fpn.interpolation_mode
 
     @script_method_wrapper
-    def forward(self, x1=NoneTensor, x2=NoneTensor, x3=NoneTensor, x4=NoneTensor, x5=NoneTensor, x6=NoneTensor, x7=NoneTensor):
+    def forward(self, x1=None, x2=None, x3=None, x4=None, x5=None, x6=None, x7=None):
+        # type: (Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor]) -> List[Tensor]
         """
         Args:
             - convouts (list): A list of convouts for the corresponding layers in in_channels.
@@ -1057,20 +880,21 @@ class FPN_phase_1(ScriptModuleWrapper):
         """
 
         convouts_ = [x1, x2, x3, x4, x5, x6, x7]
+        # convouts = [x for x in convouts if x is not None]
         convouts = []
         j = 0
         while j < len(convouts_):
-            if convouts_[j] is not None and convouts_[j].size(0):
-                convouts.append(convouts_[j])
+            t = convouts_[j]
+            if t is not None:
+                convouts.append(t)
             j += 1
-        # convouts = [x for x in convouts if x is not None]
 
         out = []
-        lat_layers = []
+        lat_feats = []
         x = torch.zeros(1, device=convouts[0].device)
         for i in range(len(convouts)):
             out.append(x)
-            lat_layers.append(x)
+            lat_feats.append(x)
 
         # For backward compatability, the conv layers are stored in reverse but the input and output is
         # given in the correct order. Thus, use j=-i-1 for the input and output and i for the conv layers.
@@ -1082,17 +906,17 @@ class FPN_phase_1(ScriptModuleWrapper):
                 _, _, h, w = convouts[j].size()
                 x = F.interpolate(x, size=(h, w), mode=self.interpolation_mode, align_corners=False)
             lat_j = lat_layer(convouts[j])
-            lat_layers[j] = lat_j
+            lat_feats[j] = lat_j
             x = x + lat_j
             out[j] = x
         
         for i in range(len(convouts)):
-            out.append(lat_layers[i])
+            out.append(lat_feats[i])
         return out
 
 
 class FPN_phase_2(ScriptModuleWrapper):
-    __constants__ = ['num_downsample', 'use_conv_downsample', 'pred_layers', 'downsample_layers']
+    __constants__ = ['num_downsample', 'use_conv_downsample']
 
     def __init__(self, in_channels):
         super().__init__()
@@ -1116,7 +940,8 @@ class FPN_phase_2(ScriptModuleWrapper):
         self.use_conv_downsample = cfg.fpn.use_conv_downsample
 
     @script_method_wrapper
-    def forward(self, x1=NoneTensor, x2=NoneTensor, x3=NoneTensor, x4=NoneTensor, x5=NoneTensor, x6=NoneTensor, x7=NoneTensor):
+    def forward(self, x1=None, x2=None, x3=None, x4=None, x5=None, x6=None, x7=None):
+        # type: (Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor]) -> List[Tensor]
         """
         Args:
             - convouts (list): A list of convouts for the corresponding layers in in_channels.
@@ -1131,8 +956,9 @@ class FPN_phase_2(ScriptModuleWrapper):
         out = []
         j = 0
         while j < len(out_):
-            if out_[j] is not None and out_[j].size(0):
-                out.append(out_[j])
+            t = out_[j]
+            if t is not None:
+                out.append(t)
             j += 1
 
         len_convouts = len(out)
@@ -1169,8 +995,7 @@ class FPN(ScriptModuleWrapper):
         - in_channels (list): For each conv layer you supply in the forward pass,
                               how many features will it have?
     """
-    __constants__ = ['interpolation_mode', 'num_downsample', 'use_conv_downsample',
-                     'lat_layers', 'pred_layers', 'downsample_layers']
+    __constants__ = ['interpolation_mode', 'num_downsample', 'use_conv_downsample']
 
     def __init__(self, in_channels):
         super().__init__()
@@ -1291,9 +1116,6 @@ class Yolact(nn.Module):
             # The include_last_relu=false here is because we might want to change it to another function
             self.proto_net, cfg.mask_dim = make_net(in_channels, cfg.mask_proto_net, include_last_relu=False)
 
-            if cfg.flow is not None and cfg.flow.proto_net_no_conflict:
-                self.proto_net_proxy, _ = make_net(in_channels, cfg.mask_proto_net, include_last_relu=False)
-
             if cfg.mask_proto_bias:
                 cfg.mask_dim += 1
 
@@ -1306,9 +1128,7 @@ class Yolact(nn.Module):
             if cfg.flow is not None:
                 self.fpn_phase_1 = FPN_phase_1([src_channels[i] for i in self.selected_layers])
                 self.fpn_phase_2 = FPN_phase_2([src_channels[i] for i in self.selected_layers])
-                if cfg.flow.fpn_no_conflict:
-                    self.fpn_phase_2_proxy = FPN_phase_2([src_channels[i] for i in self.selected_layers])
-                if cfg.flow.use_spa or cfg.flow.use_spa_both:
+                if cfg.flow.use_spa:
                     self.spa = SPA(len(self.selected_layers))
                 if cfg.flow.warp_mode == 'flow':
                     if cfg.flow.model == 'mini':
@@ -1344,22 +1164,6 @@ class Yolact(nn.Module):
                                     index         = idx)
             self.prediction_layers.append(pred)
 
-        if cfg.flow is not None and cfg.flow.pred_heads_no_conflict:
-            self.prediction_layers_proxy = nn.ModuleList()
-
-            for idx, layer_idx in enumerate(self.selected_layers):
-                # If we're sharing prediction module weights, have every module's parent be the first one
-                parent = None
-                if cfg.share_prediction_module and idx > 0:
-                    parent = self.prediction_layers_proxy[0]
-
-                pred = PredictionModule(src_channels[layer_idx], src_channels[layer_idx],
-                                        aspect_ratios = cfg.backbone.pred_aspect_ratios[idx],
-                                        scales        = cfg.backbone.pred_scales[idx],
-                                        parent        = parent,
-                                        index         = idx)
-                self.prediction_layers_proxy.append(pred)
-
         # Extra parameters for the extra losses
         if cfg.use_class_existence_loss:
             # This comes from the smallest layer selected
@@ -1378,13 +1182,15 @@ class Yolact(nn.Module):
     
     def load_weights(self, path, args=None):
         """ Loads weights from a compressed save file. """
-        state_dict = torch.load(path, map_location=torch.device(torch.cuda.current_device()))
+        state_dict = torch.load(path, map_location='cpu')
 
         # Get all possible weights
         cur_state_dict = self.state_dict()
 
         if args is not None and args.drop_weights is not None:
             drop_weight_keys = args.drop_weights.split(',')
+        
+        transfered_from_yolact = False
 
         for key in list(state_dict.keys()):
             # For backward compatability, remove these (the new variable is called layers)
@@ -1402,15 +1208,14 @@ class Yolact(nn.Module):
                         if key.startswith(drop_key):
                             del state_dict[key]
 
-                if args.coco_transfer:
-                    if key.startswith('fpn.lat_layers'):
-                        state_dict[key.replace('fpn.', 'fpn_phase_1.')] = state_dict[key]
-                        del state_dict[key]
-                    elif key.startswith('fpn.') and key in state_dict:
-                        state_dict[key.replace('fpn.', 'fpn_phase_2.')] = state_dict[key]
-                        del state_dict[key]
-                    elif 'COCO' not in cfg.dataset.name and (key.startswith('semantic_seg_conv.') or key.startswith('prediction_layers.0.conf_layer')):
-                        del state_dict[key]
+                if key.startswith('fpn.lat_layers'):
+                    transfered_from_yolact = True
+                    state_dict[key.replace('fpn.', 'fpn_phase_1.')] = state_dict[key]
+                    del state_dict[key]
+                elif key.startswith('fpn.') and key in state_dict:
+                    transfered_from_yolact = True
+                    state_dict[key.replace('fpn.', 'fpn_phase_2.')] = state_dict[key]
+                    del state_dict[key]
 
         keys_not_exist = []
         keys_not_used = []
@@ -1450,6 +1255,9 @@ class Yolact(nn.Module):
             logger.warning("Some parameters in the checkpoint have a different shape in the current model, "
                            "and are initialized as they should be: {}".format(", ".join(keys_mismatch)))
 
+        if args.coco_transfer or args.yolact_transfer:
+            logger.warning("`--coco_transfer` or `--yolact_transfer` is no longer needed. The code will automatically detect and convert YOLACT-trained weights now.")
+
         self.load_state_dict(state_dict)
 
         if not self.training:
@@ -1460,7 +1268,7 @@ class Yolact(nn.Module):
     def init_weights(self, backbone_path):
         """ Initialize weights for training. """
         # Initialize the backbone with the pretrained weights.
-        self.backbone.init_backbone(backbone_path, map_location=torch.device(torch.cuda.current_device()))
+        self.backbone.init_backbone(backbone_path)
 
         conv_constants = getattr(nn.Conv2d(1, 1, 1), '__constants__')
         
@@ -1520,6 +1328,9 @@ class Yolact(nn.Module):
         if cfg.freeze_bn:
             self.freeze_bn()
 
+        if not mode:
+            return
+        
         if cfg.flow is not None and cfg.flow.fine_tune_layers is not None:
             self.fine_tune_layers()
 
@@ -1559,7 +1370,6 @@ class Yolact(nn.Module):
         # feature matching loss
         if cfg.flow.feature_matching_loss is not None:
             def t(fea, layer_idx):
-                assert not cfg.flow.fpn_no_conflict
                 fpn_net = self.fpn_phase_2
                 pred_layer = fpn_net.pred_layers[layer_idx + 1]
                 bias = pred_layer.bias.detach() if pred_layer.bias is not None else None
@@ -1602,57 +1412,6 @@ class Yolact(nn.Module):
             losses['W'] = loss_W * cfg.flow.fm_loss_alpha
         return losses
 
-    @staticmethod
-    def visualize_nonlocal(net_outs, prev_images, cur_images):
-        from random import random
-        import cv2
-        from layers.output_utils import undo_image_transformation
-        import itertools
-
-        target_size = (64, 64)
-        prev_image = F.interpolate(prev_images, target_size, mode='area')[0]
-        cur_image = F.interpolate(cur_images, target_size, mode='area')[0]
-
-        prev_image = undo_image_transformation(prev_image, target_size[0], target_size[1]).astype('float32')
-        cur_image_ = undo_image_transformation(cur_image, target_size[0], target_size[1]).astype('float32')
-
-        images_stack = []
-        image_hw = target_size[0]
-
-        num_grids = 5
-        for hh, ww in itertools.product(range(num_grids), range(num_grids)):
-            ratio_hh = hh / num_grids
-            ratio_ww = ww / num_grids
-            rand_hh, rand_ww = int(ratio_hh * image_hw), int(ratio_ww * image_hw)
-
-            cur_image = cur_image_.copy()
-            cur_image[rand_hh, rand_ww, :] = (1, 0, 0)
-            images_stack.append(prev_image.transpose(2, 0, 1))
-            images_stack.append(cur_image.transpose(2, 0, 1))
-
-            for nl_cache in net_outs["nl_caches"]:
-                feat_hw = int(nl_cache.size(1) ** 0.5)
-                inter_hw = int(nl_cache.size(2) ** 0.5)
-                nl_cache = nl_cache.view(-1, feat_hw, feat_hw, inter_hw, inter_hw)
-
-                rand_h = int(feat_hw / image_hw * rand_hh)
-                rand_w = int(feat_hw / image_hw * rand_ww)
-
-                heat_map = nl_cache[0, rand_h, rand_w].data.cpu().numpy()
-
-                heat_map_min, heat_map_max = heat_map.min(), heat_map.max()
-                heat_map = (heat_map - heat_map_min) / (heat_map_max - heat_map_min)
-                heat_map_u8 = (heat_map * 255).astype('uint8')
-                heat_map_image = cv2.applyColorMap(heat_map_u8, cv2.COLORMAP_JET)
-                heat_map_image = cv2.resize(heat_map_image, target_size)
-                heat_map_image = (heat_map_image / 255.0).astype('float32')
-
-                blend_ratio = 0.6
-                heatmap = cv2.addWeighted(heat_map_image, blend_ratio, prev_image, 1.0 - blend_ratio, 0)
-                heatmap = heatmap.transpose(2, 0, 1)
-                images_stack.append(heatmap)
-        return images_stack
-
     def forward_flow(self, extras):
         imgs_1, imgs_2 = extras
 
@@ -1687,80 +1446,80 @@ class Yolact(nn.Module):
             return
 
         logger = logging.getLogger("yolact.model.load")
-        logger.info("Creating partial backbone...")
+        logger.debug("Creating partial backbone...")
 
         backbone = construct_backbone(cfg.backbone)
         backbone.load_state_dict(self.backbone.state_dict())
         backbone.layers = backbone.layers[:2]
 
         self.partial_backbone = backbone
-        logger.info("Partial backbone created...")
+        logger.debug("Partial backbone created...")
     
-    def _get_trt_cache_path(self, module_name, int8_mode=False):
-        return "{}.{}{}.trt".format(self.model_path, module_name, ".int8_{}".format(cfg.torch2trt_max_calibration_images) if int8_mode else "")
+    def _get_trt_cache_path(self, module_name, int8_mode=False, batch_size=1):
+        return "{}.{}{}{}.trt".format(self.model_path, module_name, ".int8_{}".format(cfg.torch2trt_max_calibration_images) if int8_mode else "", "_bs_{}".format(batch_size))
 
-    def has_trt_cached_module(self, module_name, int8_mode=False):
-        module_path = self._get_trt_cache_path(module_name, int8_mode)
+    def has_trt_cached_module(self, module_name, int8_mode=False, batch_size=1):
+        module_path = self._get_trt_cache_path(module_name, int8_mode, batch_size)
         return os.path.isfile(module_path)
 
-    def load_trt_cached_module(self, module_name, int8_mode=False):
-        module_path = self._get_trt_cache_path(module_name, int8_mode)
+    def load_trt_cached_module(self, module_name, int8_mode=False, batch_size=1):
+        module_path = self._get_trt_cache_path(module_name, int8_mode, batch_size)
         if not os.path.isfile(module_path):
             return None
         module = TRTModule()
         module.load_state_dict(torch.load(module_path))
         return module
 
-    def save_trt_cached_module(self, module, module_name, int8_mode=False):
-        module_path = self._get_trt_cache_path(module_name, int8_mode)
+    def save_trt_cached_module(self, module, module_name, int8_mode=False, batch_size=1):
+        module_path = self._get_trt_cache_path(module_name, int8_mode, batch_size)
         torch.save(module.state_dict(), module_path)
 
-    def trt_load_if(self, module_name, trt_fn, trt_fn_params, int8_mode=False, parent=None):
+    def trt_load_if(self, module_name, trt_fn, trt_fn_params, int8_mode=False, parent=None, batch_size=1):
         if parent is None: parent=self
         if not hasattr(parent, module_name): return
         module = getattr(parent, module_name)
-        trt_cache = self.load_trt_cached_module(module_name, int8_mode)
+        trt_cache = self.load_trt_cached_module(module_name, int8_mode, batch_size=batch_size)
         if trt_cache is None:
             module = trt_fn(module, trt_fn_params)
-            self.save_trt_cached_module(module, module_name, int8_mode)
+            self.save_trt_cached_module(module, module_name, int8_mode, batch_size=batch_size)
         else:
             module = trt_cache
 
         setattr(parent, module_name, module)
 
-    def to_tensorrt_backbone(self, int8_mode=False, calibration_dataset=None):
+    def to_tensorrt_backbone(self, int8_mode=False, calibration_dataset=None, batch_size=1):
         """Converts the Backbone to a TRTModule.
         """
         if int8_mode:
-            trt_fn = partial(torch2trt, int8_mode=True, int8_calib_dataset=calibration_dataset, strict_type_constraints=True)
+            trt_fn = partial(torch2trt, int8_mode=True, int8_calib_dataset=calibration_dataset, strict_type_constraints=True, max_batch_size=batch_size)
         else:
-            trt_fn = partial(torch2trt, fp16_mode=True, strict_type_constraints=True)
+            trt_fn = partial(torch2trt, fp16_mode=True, strict_type_constraints=True, max_batch_size=batch_size)
 
         x = torch.ones((1, 3, cfg.max_size, cfg.max_size)).cuda()
         # self.backbone = trt_fn(self.backbone, [x])
         # self.partial_backbone = trt_fn(self.partial_backbone, [x])
-        self.trt_load_if("backbone", trt_fn, [x], int8_mode)
-        self.trt_load_if("partial_backbone", trt_fn, [x], int8_mode)
+        self.trt_load_if("backbone", trt_fn, [x], int8_mode, batch_size=batch_size)
+        self.trt_load_if("partial_backbone", trt_fn, [x], int8_mode, batch_size=batch_size)
 
-    def to_tensorrt_protonet(self, int8_mode=False, calibration_dataset=None):
+    def to_tensorrt_protonet(self, int8_mode=False, calibration_dataset=None, batch_size=1):
         """Converts ProtoNet to a TRTModule.
         """
         if int8_mode:
-            trt_fn = partial(torch2trt, int8_mode=True, int8_calib_dataset=calibration_dataset, strict_type_constraints=True)
+            trt_fn = partial(torch2trt, int8_mode=True, int8_calib_dataset=calibration_dataset, strict_type_constraints=True, max_batch_size=batch_size)
         else:
-            trt_fn = partial(torch2trt, fp16_mode=True, strict_type_constraints=True)
+            trt_fn = partial(torch2trt, fp16_mode=True, strict_type_constraints=True, max_batch_size=batch_size)
 
         x = torch.ones((1, 256, 69, 69)).cuda()
         # self.proto_net = trt_fn(self.proto_net, [x])
-        self.trt_load_if("proto_net", trt_fn, [x], int8_mode)
+        self.trt_load_if("proto_net", trt_fn, [x], int8_mode, batch_size=batch_size)
 
-    def to_tensorrt_fpn(self, int8_mode=False, calibration_dataset=None):
+    def to_tensorrt_fpn(self, int8_mode=False, calibration_dataset=None, batch_size=1):
         """Converts FPN to a TRTModule.
         """
         if int8_mode:
-            trt_fn = partial(torch2trt, int8_mode=True, int8_calib_dataset=calibration_dataset, strict_type_constraints=True)
+            trt_fn = partial(torch2trt, int8_mode=True, int8_calib_dataset=calibration_dataset, strict_type_constraints=True, max_batch_size=batch_size)
         else:
-            trt_fn = partial(torch2trt, fp16_mode=True, strict_type_constraints=True)
+            trt_fn = partial(torch2trt, fp16_mode=True, strict_type_constraints=True, max_batch_size=batch_size)
 
         self.lat_layer = self.fpn_phase_1.lat_layers[-1]
 
@@ -1779,7 +1538,7 @@ class Yolact(nn.Module):
         else:
             raise ValueError("Backbone: {} is not currently supported with TensorRT.".format(cfg.backbone.name))
 
-        self.trt_load_if("fpn_phase_1", trt_fn, x, int8_mode)
+        self.trt_load_if("fpn_phase_1", trt_fn, x, int8_mode, batch_size=batch_size)
 
         if cfg.backbone.name == "ResNet50" or cfg.backbone.name == "ResNet101":
             x = [
@@ -1796,7 +1555,7 @@ class Yolact(nn.Module):
         else:
             raise ValueError("Backbone: {} is not currently supported with TensorRT.".format(cfg.backbone.name))
 
-        self.trt_load_if("fpn_phase_2", trt_fn, x, int8_mode)
+        self.trt_load_if("fpn_phase_2", trt_fn, x, int8_mode, batch_size=batch_size)
 
         trt_fn = partial(torch2trt, fp16_mode=True, strict_type_constraints=True)
 
@@ -1807,49 +1566,49 @@ class Yolact(nn.Module):
         else:
             raise ValueError("Backbone: {} is not currently supported with TensorRT.".format(cfg.backbone.name))
 
-        self.trt_load_if("lat_layer", trt_fn, [x], int8_mode=False)
+        self.trt_load_if("lat_layer", trt_fn, [x], int8_mode=False, batch_size=batch_size)
 
-    def to_tensorrt_prediction_head(self, int8_mode=False, calibration_dataset=None):
+    def to_tensorrt_prediction_head(self, int8_mode=False, calibration_dataset=None, batch_size=1):
         """Converts Prediction Head to a TRTModule.
         """
         if int8_mode:
-            trt_fn = partial(torch2trt, int8_mode=True, int8_calib_dataset=calibration_dataset, strict_type_constraints=True)
+            trt_fn = partial(torch2trt, int8_mode=True, int8_calib_dataset=calibration_dataset, strict_type_constraints=True, max_batch_size=batch_size)
         else:
-            trt_fn = partial(torch2trt, fp16_mode=True, strict_type_constraints=True)
+            trt_fn = partial(torch2trt, fp16_mode=True, strict_type_constraints=True, max_batch_size=batch_size)
 
         for idx, pred_layer in enumerate(self.prediction_layers):
             pred_layer = PredictionModuleTRTWrapper(pred_layer)
-            pred_layer.to_tensorrt()
+            pred_layer.to_tensorrt(batch_size=batch_size)
             self.prediction_layers[idx] = pred_layer
 
-    def to_tensorrt_spa(self, int8_mode=False, calibration_dataset=None):
+    def to_tensorrt_spa(self, int8_mode=False, calibration_dataset=None, batch_size=1):
         """Converts SPA to a TRTModule.
         """
         if int8_mode:
-            trt_fn = partial(torch2trt, int8_mode=True, int8_calib_dataset=calibration_dataset, strict_type_constraints=True)
+            trt_fn = partial(torch2trt, int8_mode=True, int8_calib_dataset=calibration_dataset, strict_type_constraints=True, max_batch_size=batch_size)
         else:
-            trt_fn = partial(torch2trt, fp16_mode=True, strict_type_constraints=True)
+            trt_fn = partial(torch2trt, fp16_mode=True, strict_type_constraints=True, max_batch_size=batch_size)
 
         c3 = torch.ones((1, 256, 69, 69)).cuda()
         f2 = torch.ones((1, 256, 35, 35)).cuda()
         f3 = torch.ones((1, 256, 18, 18)).cuda()
 
-        self.trt_load_if("spa", trt_fn, [c3, f2, f3], int8_mode, parent=self.spa)
+        self.trt_load_if("spa", trt_fn, [c3, f2, f3], int8_mode, parent=self.spa, batch_size=batch_size)
 
-    def to_tensorrt_flow_net(self, int8_mode=False, calibration_dataset=None):
+    def to_tensorrt_flow_net(self, int8_mode=False, calibration_dataset=None, batch_size=1):
         """Converts FlowNet to a TRTModule.
         """
         if int8_mode:
-            trt_fn = partial(torch2trt, int8_mode=True, int8_calib_dataset=calibration_dataset, strict_type_constraints=True)
+            trt_fn = partial(torch2trt, int8_mode=True, int8_calib_dataset=calibration_dataset, strict_type_constraints=True, max_batch_size=batch_size)
         else:
-            trt_fn = partial(torch2trt, fp16_mode=True, strict_type_constraints=True)
+            trt_fn = partial(torch2trt, fp16_mode=True, strict_type_constraints=True, max_batch_size=batch_size)
 
 
         lateral_channels = cfg.fpn.num_features
         if len(cfg.flow.reduce_channels) > 0:
             lateral_channels = cfg.flow.reduce_channels[-1]
         x = torch.ones((1, lateral_channels * 2, 69, 69)).cuda()
-        self.trt_load_if("flow_net", trt_fn, [x], int8_mode, parent=self.flow_net)
+        self.trt_load_if("flow_net", trt_fn, [x], int8_mode, parent=self.flow_net, batch_size=batch_size)
 
     def forward(self, x, extras=None):
         """ The input should be of size [batch_size, 3, img_h, img_w] """
@@ -1941,11 +1700,7 @@ class Yolact(nn.Module):
 
                     outs_wrapper["outs_phase_1"] = outs_phase_1.copy()
 
-                fpn_phase_2 = self.fpn_phase_2_proxy \
-                    if cfg.flow is not None and cfg.flow.fpn_no_conflict and extras["backbone"] == "partial" \
-                    else self.fpn_phase_2
-
-                outs = fpn_phase_2(*outs_phase_1)
+                outs = self.fpn_phase_2(*outs_phase_1)
                 if extras["backbone"] == "partial":
                     outs_wrapper["outs_phase_2"] = [out for out in outs]
                 else:
@@ -1968,10 +1723,7 @@ class Yolact(nn.Module):
                     grids = self.grid.repeat(proto_x.size(0), 1, 1, 1)
                     proto_x = torch.cat([proto_x, grids], dim=1)
 
-                if cfg.flow is not None and cfg.flow.proto_net_no_conflict and extras["backbone"] == "partial":
-                    proto_out = self.proto_net_proxy(proto_x)
-                else:
-                    proto_out = self.proto_net(proto_x)
+                proto_out = self.proto_net(proto_x)
 
                 proto_out = cfg.mask_proto_prototype_activation(proto_out)
 
@@ -1996,11 +1748,7 @@ class Yolact(nn.Module):
             if cfg.use_instance_coeff:
                 pred_outs['inst'] = []
 
-            prediction_layers = self.prediction_layers_proxy \
-                if cfg.flow is not None and cfg.flow.pred_heads_no_conflict and extras["backbone"] == "partial" \
-                else self.prediction_layers
-            
-            for idx, pred_layer in zip(self.selected_layers, prediction_layers):
+            for idx, pred_layer in zip(self.selected_layers, self.prediction_layers):
                 pred_x = outs[idx]
 
                 if cfg.mask_type == mask_type.lincomb and cfg.mask_proto_prototypes_as_features:
@@ -2011,8 +1759,8 @@ class Yolact(nn.Module):
                 # This is re-enabled during training or non-TRT inference.
                 if self.training or not (cfg.torch2trt_prediction_module or cfg.torch2trt_prediction_module_int8):
                     # A hack for the way dataparallel works
-                    if cfg.share_prediction_module and pred_layer is not prediction_layers[0]:
-                        pred_layer.parent = [prediction_layers[0]]
+                    if cfg.share_prediction_module and pred_layer is not self.prediction_layers[0]:
+                        pred_layer.parent = [self.prediction_layers[0]]
 
                 p = pred_layer(pred_x)
                 
@@ -2046,8 +1794,7 @@ class Yolact(nn.Module):
             else:
                 pred_outs['conf'] = F.softmax(pred_outs['conf'], -1)
 
-            extras = {}
-            outs_wrapper["pred_outs"] = self.detect(pred_outs, extras=extras)
+            outs_wrapper["pred_outs"] = self.detect(pred_outs)
         return outs_wrapper
 
 

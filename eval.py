@@ -31,7 +31,8 @@ import cv2
 import logging
 
 import math
-from copy import deepcopy
+
+from utils.tensorrt import convert_to_tensorrt
 
 def str2bool(v):
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
@@ -117,10 +118,22 @@ def parse_args(argv=None):
                         help='If specified, override the dataset specified in the config with this one (example: coco2017_dataset).')
     parser.add_argument('--detect', default=False, dest='detect', action='store_true',
                         help='Don\'t evauluate the mask branch at all and only do object detection. This only works for --display and --benchmark.')
+    parser.add_argument('--yolact_transfer', dest='yolact_transfer', action='store_true',
+                        help='Split pretrained FPN weights to two phase FPN (for models trained by YOLACT).')
     parser.add_argument('--coco_transfer', dest='coco_transfer', action='store_true',
-                        help='Split pretrained FPN weights to two phase FPN.')
+                        help='[Deprecated] Split pretrained FPN weights to two phase FPN (for models trained by YOLACT).')
     parser.add_argument('--drop_weights', default=None, type=str,
                         help='Drop specified weights (split by comma) from existing model.')
+    parser.add_argument('--calib_images', default=None, type=str,
+                        help='Directory of images for TensorRT INT8 calibration, for explanation of this field, please refer to `calib_images` in `data/config.py`.')
+    parser.add_argument('--trt_batch_size', default=1, type=int,
+                        help='Maximum batch size to use during TRT conversion. This has to be greater than or equal to the batch size the model will take during inferece.')
+    parser.add_argument('--disable_tensorrt', default=False, dest='disable_tensorrt', action='store_true',
+                        help='Don\'t use TensorRT optimization when specified.')
+    parser.add_argument('--use_fp16_tensorrt', default=False, dest='use_fp16_tensorrt', action='store_true',
+                        help='This replaces all TensorRT INT8 optimization with FP16 optimization when specified.')
+    parser.add_argument('--use_tensorrt_safe_mode', default=False, dest='use_tensorrt_safe_mode', action='store_true',
+                        help='This enables the safe mode that is a workaround for various TensorRT engine issues.')
 
     parser.set_defaults(no_bar=False, display=False, resume=False, output_coco_json=False, output_web_json=False, shuffle=False,
                         benchmark=False, no_sort=False, no_hash=False, mask_proto_debug=False, crop=True, detect=False)
@@ -305,7 +318,7 @@ class Detections:
             'segmentation': rle,
             'score': float(score)
         })
-    
+
     def dump(self):
         dump_arguments = [
             (self.bbox_data, args.bbox_det_file),
@@ -571,12 +584,34 @@ def badhash(x):
     x =  ((x >> 16) ^ x) & 0xFFFFFFFF
     return x
 
-def evalimage(net:Yolact, path:str, save_path:str=None):
+def evalimage(net:Yolact, path:str, save_path:str=None, detections:Detections=None, image_id=None):
     frame = torch.from_numpy(cv2.imread(path)).cuda().float()
     batch = FastBaseTransform()(frame.unsqueeze(0))
-    preds = net(batch)
+
+    if cfg.flow.warp_mode != 'none':
+        assert False, "Evaluating the image with a video-based model. If you believe this is a problem, please report a issue at GitHub, thanks."
+
+    extras = {"backbone": "full", "interrupt": False, "keep_statistics": False, "moving_statistics": None}
+
+
+    preds = net(batch, extras=extras)["pred_outs"]
 
     img_numpy = prep_display(preds, frame, None, None, undo_transform=False)
+
+    if args.output_coco_json:
+        with timer.env('Postprocess'):
+            _, _, h, w = batch.size()
+            classes, scores, boxes, masks = \
+                postprocess(preds, w, h, crop_masks=args.crop, score_threshold=args.score_threshold)
+
+        with timer.env('JSON Output'):
+            boxes = boxes.cpu().numpy()
+            masks = masks.view(-1, h, w).cpu().numpy()
+            for i in range(masks.shape[0]):
+                # Make sure that the bounding box actually makes sense and a mask was produced
+                if (boxes[i, 3] - boxes[i, 1]) * (boxes[i, 2] - boxes[i, 0]) > 0:
+                    detections.add_bbox(image_id, classes[i], boxes[i,:],   scores[i])
+                    detections.add_mask(image_id, classes[i], masks[i,:,:], scores[i])
     
     if save_path is None:
         img_numpy = img_numpy[:, :, (2, 1, 0)]
@@ -588,19 +623,20 @@ def evalimage(net:Yolact, path:str, save_path:str=None):
     else:
         cv2.imwrite(save_path, img_numpy)
 
-def evalimages(net:Yolact, input_folder:str, output_folder:str):
+def evalimages(net:Yolact, input_folder:str, output_folder:str, detections:Detections=None):
     if not os.path.exists(output_folder):
         os.mkdir(output_folder)
 
     print()
-    for p in Path(input_folder).glob('*'): 
+    for i, p in enumerate(Path(input_folder).glob('*')):
         path = str(p)
         name = os.path.basename(path)
         name = '.'.join(name.split('.')[:-1]) + '.png'
         out_path = os.path.join(output_folder, name)
 
-        evalimage(net, path, out_path)
+        evalimage(net, path, out_path, detections=detections, image_id=str(i))
         print(path + ' -> ' + out_path)
+
     print('Done.')
 
 from multiprocessing.pool import ThreadPool
@@ -673,7 +709,7 @@ def evalvideo(net:Yolact, path:str):
                 with torch.no_grad():
                     net_outs = net(imgs, extras=extras)
             frame_idx += 1
-            # return frames, net(imgs)
+
             return frames, net_outs["pred_outs"]
 
     def prep_frame(inp):
@@ -858,16 +894,30 @@ def evaluate(net:Yolact, dataset, train_mode=False, train_cfg=None):
     net.detect.use_fast_nms = args.fast_nms
     cfg.mask_proto_debug = args.mask_proto_debug
 
+    detections = None
+    if args.output_coco_json and (args.image or args.images):
+        detections = Detections()
+        prep_coco_cats()
+
     if args.image is not None:
         if ':' in args.image:
             inp, out = args.image.split(':')
-            evalimage(net, inp, out)
+            evalimage(net, inp, out, detections=detections, image_id="0")
         else:
-            evalimage(net, args.image)
+            evalimage(net, args.image, detections=detections, image_id="0")
+
+        if args.output_coco_json:
+            detections.dump()
+
         return
+
     elif args.images is not None:
         inp, out = args.images.split(':')
-        evalimages(net, inp, out)
+        evalimages(net, inp, out, detections=detections)
+
+        if args.output_coco_json:
+            detections.dump()
+            
         return
     elif args.video is not None:
         if ':' in args.video:
@@ -876,6 +926,7 @@ def evaluate(net:Yolact, dataset, train_mode=False, train_cfg=None):
         else:
             evalvideo(net, args.video)
         return
+
 
     frame_times = MovingAverage(max_window_size=100000)
     dataset_size = len(dataset) if args.max_images < 0 else min(args.max_images, len(dataset))
@@ -1176,7 +1227,8 @@ if __name__ == '__main__':
         set_dataset(args.dataset)
 
     from utils.logging_helper import setup_logger
-    logger = setup_logger("yolact.eval")
+    setup_logger(logging_level=logging.INFO)
+    logger = logging.getLogger("yolact.eval")
 
     with torch.no_grad():
         if not os.path.exists('results'):
@@ -1209,7 +1261,7 @@ if __name__ == '__main__':
                                         transform=BaseTransform(), has_gt=cfg.dataset.has_gt)
             prep_coco_cats()
         else:
-            dataset = None        
+            dataset = None
 
         logger.info('Loading model...')
         net = Yolact(training=False)
@@ -1220,166 +1272,7 @@ if __name__ == '__main__':
         net.eval()
         logger.info('Model loaded.')
 
-        logger.info("Converting to TensorRT...")
-
-        net.model_path = args.trained_model
-
-        calibration_dataset = None
-        calibration_protonet_dataset = None
-        calibration_ph_dataset = None
-        calibration_fpn_dataset = None
-        calibration_flow_net_dataset = None
-
-        if (cfg.torch2trt_backbone_int8 or cfg.torch2trt_protonet_int8 or cfg.torch2trt_flow_net_int8):
-            if (not cfg.torch2trt_backbone_int8 or net.has_trt_cached_module('backbone', True)) and \
-                (not cfg.torch2trt_protonet_int8 or net.has_trt_cached_module('proto_net', True)) and \
-                    (not cfg.torch2trt_flow_net_int8 or net.has_trt_cached_module('flow_net', True)):
-                print('Skipping generation of calibration dataset for backbone/flow_net because there is cache...')
-            else:
-                print('Generating calibration dataset for backbone of {} images...'.format(cfg.torch2trt_max_calibration_images))
-
-                if cfg.dataset.name == "YouTube VIS":
-                    calib_dataset = YoutubeVIS(image_path=cfg.dataset.train_images,
-                                            info_file=cfg.dataset.train_info,
-                                            configs=cfg.dataset,
-                                            transform=BaseTransformVideo(MEANS), has_gt=cfg.dataset.has_gt)
-
-                    calibration_data_cpu = [calib_dataset.pull_video(video_idx, full_video=True, max_images=5) for video_idx in list(range(cfg.torch2trt_max_calibration_images))]
-
-                    calibration_dataset = [vid[0][0][0] for vid in calibration_data_cpu]
-                    calibration_dataset = torch.stack(calibration_dataset)
-
-                    calibration_next_dataset = [vid[0][4][0] for vid in calibration_data_cpu]
-                    calibration_next_dataset = torch.stack(calibration_next_dataset)
-
-                    if args.cuda:
-                        calibration_dataset = calibration_dataset.cuda()
-                        calibration_next_dataset = calibration_next_dataset.cuda()
-                else:
-                    # Save the old dataset configuration just in case we need to restore.
-                    old_dataset = deepcopy(cfg.dataset)
-
-                    # Set dataset to COCO 2017 otherwise when we're evaluating on test-dev this will fail
-                    set_dataset("coco2017_dataset")
-                    calibration = COCODetection(cfg.dataset.train_images, cfg.dataset.train_info,
-                                                transform=BaseTransform(), has_gt=cfg.dataset.has_gt)
-
-                    # Revert dataset back to what it's supposed to be: 
-                    if args.dataset is not None:
-                        set_dataset(args.dataset)
-                    else:
-                        cfg.dataset = old_dataset
-
-                    print('Calibrating with {} images...'.format(cfg.torch2trt_max_calibration_images))
-                    dataset_indices = list(range(cfg.torch2trt_max_calibration_images))
-                    calibration_dataset = [calibration.pull_item(image_idx)[0] for image_idx in dataset_indices]
-                    calibration_dataset = torch.stack(calibration_dataset)
-
-                    if args.cuda:
-                        calibration_dataset = calibration_dataset.cuda()
-
-        n_images_per_batch = 1
-        if cfg.torch2trt_protonet_int8:
-            if net.has_trt_cached_module('proto_net', True):
-                print('Skipping generation of calibration dataset for protonet because there is cache...')
-            else:
-                print('Generating calibration dataset for protonet with {} images...'.format(cfg.torch2trt_max_calibration_images))
-                calibration_protonet_dataset = []
-
-                def forward_hook(self, inputs, outputs):
-                    calibration_protonet_dataset.append(inputs[0])
-
-                proto_net_handle = net.proto_net.register_forward_hook(forward_hook)
-
-        if (cfg.torch2trt_protonet_int8 or cfg.torch2trt_flow_net_int8):
-            if (not cfg.torch2trt_protonet_int8 or net.has_trt_cached_module('proto_net', True)) and (not cfg.torch2trt_flow_net_int8 or net.has_trt_cached_module('flow_net', True)):
-                print('Skipping generation of calibration dataset for protonet/flow_net because there is cache...')
-            else:
-                with torch.no_grad():
-                    laterals = []
-                    f1, f2, f3 = [], [], []
-                    for i in range(math.ceil(cfg.torch2trt_max_calibration_images / n_images_per_batch)):
-                        gt_forward_out = net(calibration_dataset[i*n_images_per_batch:(i+1)*n_images_per_batch], extras={
-                            "backbone": "full",
-                            "keep_statistics": True,
-                            "moving_statistics": None
-                        })
-                        laterals.append(gt_forward_out["lateral"])
-                        f1.append(gt_forward_out["feats"][0])
-                        f2.append(gt_forward_out["feats"][1])
-                        f3.append(gt_forward_out["feats"][2])
-
-                laterals = torch.cat(laterals, dim=0)
-                f1 = torch.cat(f1, dim=0)
-                f2 = torch.cat(f2, dim=0)
-                f3 = torch.cat(f3, dim=0)
-
-        if cfg.torch2trt_protonet_int8:
-            if net.has_trt_cached_module('proto_net', True):
-                print('Skipping generation of calibration dataset for protonet because there is cache...')
-            else:
-                proto_net_handle.remove()
-                calibration_protonet_dataset = torch.cat(calibration_protonet_dataset, dim=0)
-
-        if cfg.torch2trt_flow_net_int8:
-            if net.has_trt_cached_module('flow_net', True):
-                print('Skipping generation of calibration dataset for flow_net because there is cache...')
-            else:
-                print('Generating calibration dataset for flow_net with {} images...'.format(cfg.torch2trt_max_calibration_images))
-                calibration_flow_net_dataset = []
-
-                def forward_hook(self, inputs, outputs):
-                    calibration_flow_net_dataset.append(inputs[0])
-
-                handle = net.flow_net.flow_net.register_forward_hook(forward_hook)
-                for i in range(math.ceil(cfg.torch2trt_max_calibration_images / n_images_per_batch)):
-                    extras = {
-                        "backbone": "partial",
-                        "moving_statistics": {
-                            "lateral": laterals[i*n_images_per_batch:(i+1)*n_images_per_batch],
-                            "feats": [
-                                f1[i*n_images_per_batch:(i+1)*n_images_per_batch],
-                                f2[i*n_images_per_batch:(i+1)*n_images_per_batch],
-                                f3[i*n_images_per_batch:(i+1)*n_images_per_batch]
-                            ]
-                        }
-                    }
-                    with torch.no_grad():
-                        net(calibration_next_dataset[i*n_images_per_batch:(i+1)*n_images_per_batch], extras=extras)
-                handle.remove()
-
-                calibration_flow_net_dataset = torch.cat(calibration_flow_net_dataset, dim=0)
-
-        if cfg.torch2trt_backbone or cfg.torch2trt_backbone_int8:
-            print("Converting backbone to TensorRT...")
-            net.to_tensorrt_backbone(cfg.torch2trt_backbone_int8, calibration_dataset=calibration_dataset)
-
-        if cfg.torch2trt_protonet or cfg.torch2trt_protonet_int8:
-            print("Converting protonet to TensorRT...")
-            net.to_tensorrt_protonet(cfg.torch2trt_protonet_int8, calibration_dataset=calibration_protonet_dataset)
-
-        if cfg.torch2trt_fpn or cfg.torch2trt_fpn_int8:
-            print("Converting FPN to TensorRT...")
-            net.to_tensorrt_fpn(cfg.torch2trt_fpn_int8)
-            # net.fpn_phase_1.to_tensorrt(cfg.torch2trt_fpn_int8)
-            # net.fpn_phase_2.to_tensorrt(cfg.torch2trt_fpn_int8)
-
-        if cfg.torch2trt_prediction_module or cfg.torch2trt_prediction_module_int8:
-            print("Converting PredictionModule to TensorRT...")
-            net.to_tensorrt_prediction_head(cfg.torch2trt_prediction_module_int8)
-            # for prediction_layer in net.prediction_layers:
-            #     prediction_layer.to_tensorrt(cfg.torch2trt_prediction_module_int8)
-
-        if cfg.torch2trt_spa or cfg.torch2trt_spa_int8:
-            print('Converting SPA to TensorRT...')
-            assert not cfg.torch2trt_spa_int8
-            net.to_tensorrt_spa(cfg.torch2trt_spa_int8)
-
-        if cfg.torch2trt_flow_net or cfg.torch2trt_flow_net_int8:
-            print('Converting flow_net to TensorRT...')
-            net.to_tensorrt_flow_net(cfg.torch2trt_flow_net_int8, calibration_dataset=calibration_flow_net_dataset)
-
-        logger.info("Converted to TensorRT.")
+        convert_to_tensorrt(net, cfg, args, transform=BaseTransform())
 
         if args.cuda:
             net = net.cuda()
