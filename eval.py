@@ -31,7 +31,7 @@ import cv2
 import logging
 
 import math
-yolact_args = None
+args = None
 from utils.tensorrt import convert_to_tensorrt
 
 def str2bool(v):
@@ -138,15 +138,15 @@ def parse_args(argv=None):
     parser.set_defaults(no_bar=False, display=False, resume=False, output_coco_json=False, output_web_json=False, shuffle=False,
                         benchmark=False, no_sort=False, no_hash=False, mask_proto_debug=False, crop=True, detect=False)
 
-    global yolact_args
-    yolact_args = parser.parse_args(argv)
+    global args
+    args = parser.parse_args(argv)
     print("Yolact args initialized")
-    if yolact_args.output_web_json:
-        yolact_args.output_coco_json = True
+    if args.output_web_json:
+        args.output_coco_json = True
     
-    if yolact_args.seed is not None:
-        random.seed(yolact_args.seed)
-    return yolact_args
+    if args.seed is not None:
+        random.seed(args.seed)
+    return args
 
 iou_thresholds = [x / 100 for x in range(50, 100, 5)]
 coco_cats = {} # Call prep_coco_cats to fill this
@@ -165,20 +165,20 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
         h, w, _ = img.shape
     
     with timer.env('Postprocess'):
-        t = postprocess(dets_out, w, h, visualize_lincomb=yolact_args.display_lincomb,
-                                        crop_masks       =yolact_args.crop,
-                                        score_threshold  =yolact_args.score_threshold)
+        t = postprocess(dets_out, w, h, visualize_lincomb=args.display_lincomb,
+                                        crop_masks       =args.crop,
+                                        score_threshold  =args.score_threshold)
         torch.cuda.synchronize()
 
     with timer.env('Copy'):
         if cfg.eval_mask_branch:
             # Masks are drawn on the GPU, so don't copy
-            masks = t[3][:yolact_args.top_k]
-        classes, scores, boxes = [x[:yolact_args.top_k].cpu().numpy() for x in t[:3]]
+            masks = t[3][:args.top_k]
+        classes, scores, boxes = [x[:args.top_k].cpu().numpy() for x in t[:3]]
 
-    num_dets_to_consider = min(yolact_args.top_k, classes.shape[0])
+    num_dets_to_consider = min(args.top_k, classes.shape[0])
     for j in range(num_dets_to_consider):
-        if scores[j] < yolact_args.score_threshold:
+        if scores[j] < args.score_threshold:
             num_dets_to_consider = j
             break
     
@@ -207,7 +207,7 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
     # First, draw the masks on the GPU where we can do it really fast
     # Beware: very fast but possibly unintelligible mask-drawing code ahead
     # I wish I had access to OpenGL or Vulkan but alas, I guess Pytorch tensor operations will have to suffice
-    if yolact_args.display_masks and cfg.eval_mask_branch:
+    if args.display_masks and cfg.eval_mask_branch:
         # After this, mask is of size [num_dets, h, w, 1]
         masks = masks[:num_dets_to_consider, :, :, None]
         
@@ -233,18 +233,18 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
     # Note, make sure this is a uint8 tensor or opencv will not anti alias text for whatever reason
     img_numpy = (img_gpu * 255).byte().cpu().numpy()
     
-    if yolact_args.display_text or yolact_args.display_bboxes:
+    if args.display_text or args.display_bboxes:
         for j in reversed(range(num_dets_to_consider)):
             x1, y1, x2, y2 = boxes[j, :]
             color = get_color(j)
             score = scores[j]
 
-            if yolact_args.display_bboxes:
+            if args.display_bboxes:
                 cv2.rectangle(img_numpy, (x1, y1), (x2, y2), color, 1)
 
-            if yolact_args.display_text:
+            if args.display_text:
                 _class = cfg.dataset.class_names[classes[j]]
-                text_str = '%s: %.2f' % (_class, score) if yolact_args.display_scores else _class
+                text_str = '%s: %.2f' % (_class, score) if args.display_scores else _class
 
                 font_face = cv2.FONT_HERSHEY_DUPLEX
                 font_scale = 0.6
@@ -262,10 +262,10 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
 
 def prep_benchmark(dets_out, h, w):
     with timer.env('Postprocess'):
-        t = postprocess(dets_out, w, h, crop_masks=yolact_args.crop, score_threshold=yolact_args.score_threshold)
+        t = postprocess(dets_out, w, h, crop_masks=args.crop, score_threshold=args.score_threshold)
 
     with timer.env('Copy'):
-        classes, scores, boxes, masks = [x[:yolact_args.top_k].cpu().numpy() for x in t]
+        classes, scores, boxes, masks = [x[:args.top_k].cpu().numpy() for x in t]
     
     with timer.env('Sync'):
         # Just in case
@@ -322,8 +322,8 @@ class Detections:
 
     def dump(self):
         dump_arguments = [
-            (self.bbox_data, yolact_args.bbox_det_file),
-            (self.mask_data, yolact_args.mask_det_file)
+            (self.bbox_data, args.bbox_det_file),
+            (self.mask_data, args.mask_det_file)
         ]
 
         for data, path in dump_arguments:
@@ -358,7 +358,7 @@ class Detections:
                 'mask': mask['segmentation'],
             })
 
-        with open(os.path.join(yolact_args.web_det_path, '%s.json' % cfg.name), 'w') as f:
+        with open(os.path.join(args.web_det_path, '%s.json' % cfg.name), 'w') as f:
             json.dump(output, f)
         
 
@@ -391,7 +391,7 @@ def bbox_iou(bbox1, bbox2, iscrowd=False):
 
 def prep_metrics(ap_data, dets, img, gt, gt_masks, h, w, num_crowd, image_id, detections:Detections=None):
     """ Returns a list of APs for this image, with each element being for a class  """
-    if not yolact_args.output_coco_json:
+    if not args.output_coco_json:
         with timer.env('Prepare gt'):
             gt_boxes = torch.Tensor(gt[:, :4])
             gt_boxes[:, [0, 2]] *= w
@@ -406,7 +406,7 @@ def prep_metrics(ap_data, dets, img, gt, gt_masks, h, w, num_crowd, image_id, de
                 crowd_classes, gt_classes = split(gt_classes)
 
     with timer.env('Postprocess'):
-        classes, scores, boxes, masks = postprocess(dets, w, h, crop_masks=yolact_args.crop, score_threshold=yolact_args.score_threshold)
+        classes, scores, boxes, masks = postprocess(dets, w, h, crop_masks=args.crop, score_threshold=args.score_threshold)
 
         if classes.size(0) == 0:
             return
@@ -417,7 +417,7 @@ def prep_metrics(ap_data, dets, img, gt, gt_masks, h, w, num_crowd, image_id, de
         boxes = boxes.cuda()
 
 
-    if yolact_args.output_coco_json:
+    if args.output_coco_json:
         with timer.env('JSON Output'):
             boxes = boxes.cpu().numpy()
             masks = masks.view(-1, h, w).cpu().numpy()
@@ -599,11 +599,11 @@ def evalimage(net:Yolact, path:str, save_path:str=None, detections:Detections=No
 
     img_numpy = prep_display(preds, frame, None, None, undo_transform=False)
 
-    if yolact_args.output_coco_json:
+    if args.output_coco_json:
         with timer.env('Postprocess'):
             _, _, h, w = batch.size()
             classes, scores, boxes, masks = \
-                postprocess(preds, w, h, crop_masks=yolact_args.crop, score_threshold=yolact_args.score_threshold)
+                postprocess(preds, w, h, crop_masks=args.crop, score_threshold=args.score_threshold)
 
         with timer.env('JSON Output'):
             boxes = boxes.cpu().numpy()
@@ -682,7 +682,7 @@ def evalvideo(net:Yolact, path:str):
         exit()
 
     def get_next_frame(vid):
-        return [vid.read()[1] for _ in range(yolact_args.video_multiframe)]
+        return [vid.read()[1] for _ in range(args.video_multiframe)]
 
     def transform_frame(frames):
         with torch.no_grad():
@@ -745,9 +745,9 @@ def evalvideo(net:Yolact, path:str):
                 running = False
 
             buffer_size = frame_buffer.qsize()
-            if buffer_size < yolact_args.video_multiframe:
+            if buffer_size < args.video_multiframe:
                 frame_time_stabilizer += stabilizer_step
-            elif buffer_size > yolact_args.video_multiframe:
+            elif buffer_size > args.video_multiframe:
                 frame_time_stabilizer -= stabilizer_step
                 if frame_time_stabilizer < 0:
                     frame_time_stabilizer = 0
@@ -770,7 +770,7 @@ def evalvideo(net:Yolact, path:str):
 
     # For each frame the sequence of functions it needs to go through to be processed (in reversed order)
     sequence = [prep_frame, eval_network, transform_frame]
-    n_threads = len(sequence) + yolact_args.video_multiframe + 2
+    n_threads = len(sequence) + args.video_multiframe + 2
     n_threads = 4
     pool = ThreadPool(processes=n_threads)
     print("Number of threads: {}".format(n_threads))
@@ -806,7 +806,7 @@ def evalvideo(net:Yolact, path:str):
 
             if frame['idx'] == 0:
                 # Split this up into individual threads for prep_frame since it doesn't support batch size
-                active_frames += [{'value': extract_frame(frame['value'], i), 'idx': 0} for i in range(1, yolact_args.video_multiframe)]
+                active_frames += [{'value': extract_frame(frame['value'], i), 'idx': 0} for i in range(1, args.video_multiframe)]
                 frame['value'] = extract_frame(frame['value'], 0)
 
         
@@ -817,8 +817,8 @@ def evalvideo(net:Yolact, path:str):
         inference_time = time.time() - start_time
         frame_times.add(inference_time)
         inference_times.append(inference_time)
-        fps = yolact_args.video_multiframe / frame_times.get_avg()
-        np.save(yolact_args.video, np.asarray(inference_times))
+        fps = args.video_multiframe / frame_times.get_avg()
+        np.save(args.video, np.asarray(inference_times))
 
         print('\rProcessing FPS: %.2f | Video Playback FPS: %.2f | Frames in Buffer: %d    ' % (fps, video_fps, frame_buffer.qsize()), end='')
     
@@ -892,45 +892,45 @@ def savevideo(net:Yolact, in_path:str, out_path:str):
 
 
 def evaluate(net:Yolact, dataset, train_mode=False, train_cfg=None):
-    net.detect.use_fast_nms = yolact_args.fast_nms
-    cfg.mask_proto_debug = yolact_args.mask_proto_debug
+    net.detect.use_fast_nms = args.fast_nms
+    cfg.mask_proto_debug = args.mask_proto_debug
 
     detections = None
-    if yolact_args.output_coco_json and (yolact_args.image or yolact_args.images):
+    if args.output_coco_json and (args.image or args.images):
         detections = Detections()
         prep_coco_cats()
 
-    if yolact_args.image is not None:
-        if ':' in yolact_args.image:
-            inp, out = yolact_args.image.split(':')
+    if args.image is not None:
+        if ':' in args.image:
+            inp, out = args.image.split(':')
             evalimage(net, inp, out, detections=detections, image_id="0")
         else:
-            evalimage(net, yolact_args.image, detections=detections, image_id="0")
+            evalimage(net, args.image, detections=detections, image_id="0")
 
-        if yolact_args.output_coco_json:
+        if args.output_coco_json:
             detections.dump()
 
         return
 
-    elif yolact_args.images is not None:
-        inp, out = yolact_args.images.split(':')
+    elif args.images is not None:
+        inp, out = args.images.split(':')
         evalimages(net, inp, out, detections=detections)
 
-        if yolact_args.output_coco_json:
+        if args.output_coco_json:
             detections.dump()
 
         return
-    elif yolact_args.video is not None:
-        if ':' in yolact_args.video:
-            inp, out = yolact_args.video.split(':')
+    elif args.video is not None:
+        if ':' in args.video:
+            inp, out = args.video.split(':')
             savevideo(net, inp, out)
         else:
-            evalvideo(net, yolact_args.video)
+            evalvideo(net, args.video)
         return
 
 
     frame_times = MovingAverage(max_window_size=100000)
-    dataset_size = len(dataset) if yolact_args.max_images < 0 else min(yolact_args.max_images, len(dataset))
+    dataset_size = len(dataset) if args.max_images < 0 else min(args.max_images, len(dataset))
 
     if dataset.name == "YouTube VIS":
         dataset_size = len(dataset)
@@ -939,7 +939,7 @@ def evaluate(net:Yolact, dataset, train_mode=False, train_cfg=None):
 
     print()
 
-    if not yolact_args.display and not yolact_args.benchmark:
+    if not args.display and not args.benchmark:
         # For each class and iou, stores tuples (score, isPositive)
         # Index ap_data[type][iouIdx][classIdx]
         ap_data = {
@@ -953,9 +953,9 @@ def evaluate(net:Yolact, dataset, train_mode=False, train_cfg=None):
 
     dataset_indices = list(range(len(dataset)))
     
-    if yolact_args.shuffle:
+    if args.shuffle:
         random.shuffle(dataset_indices)
-    elif not yolact_args.no_sort:
+    elif not args.no_sort:
         # Do a deterministic shuffle based on the image ids
         #
         # I do this because on python 3.5 dictionary key order is *random*, while in 3.6 it's
@@ -981,7 +981,7 @@ def evaluate(net:Yolact, dataset, train_mode=False, train_cfg=None):
 
             from data.youtube_vis import YoutubeVISEval, collate_fn_youtube_vis_eval
 
-            eval_dataset = YoutubeVISEval(dataset, dataset_indices, yolact_args.max_images)
+            eval_dataset = YoutubeVISEval(dataset, dataset_indices, args.max_images)
 
             data_loader = torch.utils.data.DataLoader(eval_dataset, num_workers=1, shuffle=False,
                                                       collate_fn=collate_fn_youtube_vis_eval)
@@ -993,9 +993,9 @@ def evaluate(net:Yolact, dataset, train_mode=False, train_cfg=None):
                     if video_frames_data is None: continue
                     video_frames, extra_data = video_frames_data
 
-                frame_eval_stride = yolact_args.eval_stride
+                frame_eval_stride = args.eval_stride
 
-                num_passes = 5 if not yolact_args.benchmark and train_cfg.dataset.use_all_frames else 1
+                num_passes = 5 if not args.benchmark and train_cfg.dataset.use_all_frames else 1
                 for pass_idx in range(num_passes):
                     meet_annot = False
                     out_recorder = []
@@ -1005,7 +1005,7 @@ def evaluate(net:Yolact, dataset, train_mode=False, train_cfg=None):
                         frame_idx, annot_idx = extra['idx']
                         with timer.env('Load Data'):
                             batch = Variable(img.unsqueeze(0))
-                            if yolact_args.cuda:
+                            if args.cuda:
                                 batch = batch.cuda()
 
                         if train_cfg.flow is not None:
@@ -1024,7 +1024,7 @@ def evaluate(net:Yolact, dataset, train_mode=False, train_cfg=None):
                                     moving_statistics["lateral"] = gt_forward_out["lateral"]
                                     moving_statistics["images"] = batch
 
-                            if annot_idx == -1 and yolact_args.fast_eval:
+                            if annot_idx == -1 and args.fast_eval:
                                 continue
                             if frame_idx % frame_eval_stride != pass_idx and meet_annot and \
                                     (train_cfg.flow.warp_mode != 'none' or train_cfg.flow.use_spa):
@@ -1043,9 +1043,9 @@ def evaluate(net:Yolact, dataset, train_mode=False, train_cfg=None):
                         preds = forward_out["pred_outs"]
 
                         # Perform the meat of the operation here depending on our mode.
-                        if yolact_args.display:
+                        if args.display:
                             img_numpy = prep_display(preds, img, h, w)
-                        elif yolact_args.benchmark:
+                        elif args.benchmark:
                             new_h, new_w = h, w
                             if new_w > 640:
                                 new_w, new_h = 640, 640 * new_h // new_w
@@ -1060,13 +1060,13 @@ def evaluate(net:Yolact, dataset, train_mode=False, train_cfg=None):
                         if it > 0 or pass_idx > 0 or frame_seq_idx > frame_eval_stride:
                             frame_times.add(timer.total_time())
 
-                        if yolact_args.display:
+                        if args.display:
                             if it > 0 or pass_idx > 0 or frame_seq_idx > frame_eval_stride:
                                 print('Avg FPS: %.4f' % (1 / frame_times.get_avg()))
                             plt.imshow(img_numpy)
                             plt.title(str(dataset.ids[video_idx]))
                             plt.show()
-                        elif not yolact_args.no_bar:
+                        elif not args.no_bar:
                             if it > 0 or pass_idx > 0 or frame_seq_idx > frame_eval_stride: fps = 1 / frame_times.get_avg()
                             else: fps = 0
                             progress = (it+1) / dataset_size * 100
@@ -1089,7 +1089,7 @@ def evaluate(net:Yolact, dataset, train_mode=False, train_cfg=None):
                         np.save('scripts/gt.npy', gt_masks)
 
                     batch = Variable(img.unsqueeze(0))
-                    if yolact_args.cuda:
+                    if args.cuda:
                         batch = batch.cuda()
 
                 with timer.env('Network Extra'):
@@ -1098,9 +1098,9 @@ def evaluate(net:Yolact, dataset, train_mode=False, train_cfg=None):
                     preds = net(batch, extras=extras)["pred_outs"]
 
                 # Perform the meat of the operation here depending on our mode.
-                if yolact_args.display:
+                if args.display:
                     img_numpy = prep_display(preds, img, h, w)
-                elif yolact_args.benchmark:
+                elif args.benchmark:
                     prep_benchmark(preds, h, w)
                 else:
                     prep_metrics(ap_data, preds, img, gt, gt_masks, h, w, num_crowd, dataset.ids[image_idx], detections)
@@ -1110,13 +1110,13 @@ def evaluate(net:Yolact, dataset, train_mode=False, train_cfg=None):
                 if it > 1:
                     frame_times.add(timer.total_time())
 
-                if yolact_args.display:
+                if args.display:
                     if it > 1:
                         print('Avg FPS: %.4f' % (1 / frame_times.get_avg()))
                     plt.imshow(img_numpy)
                     plt.title(str(dataset.ids[image_idx]))
                     plt.show()
-                elif not yolact_args.no_bar:
+                elif not args.no_bar:
                     if it > 1: fps = 1 / frame_times.get_avg()
                     else: fps = 0
                     progress = (it+1) / dataset_size * 100
@@ -1124,22 +1124,22 @@ def evaluate(net:Yolact, dataset, train_mode=False, train_cfg=None):
                     print('\rProcessing Images  %s %6d / %6d (%5.2f%%)    %5.2f fps        '
                         % (repr(progress_bar), it+1, dataset_size, progress, fps), end='')
 
-        if not yolact_args.display and not yolact_args.benchmark:
+        if not args.display and not args.benchmark:
             print()
-            if yolact_args.output_coco_json:
+            if args.output_coco_json:
                 print('Dumping detections...')
-                if yolact_args.output_web_json:
+                if args.output_web_json:
                     detections.dump_web()
                 else:
                     detections.dump()
             else:
                 if not train_mode:
                     print('Saving data...')
-                    with open(yolact_args.ap_data_file, 'wb') as f:
+                    with open(args.ap_data_file, 'wb') as f:
                         pickle.dump(ap_data, f)
 
                 calc_map(ap_data)
-        elif yolact_args.benchmark:
+        elif args.benchmark:
             print()
             print()
             print('Stats for the last frame:')
@@ -1148,12 +1148,12 @@ def evaluate(net:Yolact, dataset, train_mode=False, train_cfg=None):
             print('Average: %5.2f fps, %5.2f ms' % (1 / frame_times.get_avg(), 1000*avg_seconds))
 
     except KeyboardInterrupt:
-        if not yolact_args.display and not yolact_args.benchmark:
+        if not args.display and not args.benchmark:
             print()
             logger = logging.getLogger("yolact.eval")
             logger.info('Stopping early, calculate AP based on finished proportion...')
             calc_map(ap_data)
-        elif yolact_args.benchmark:
+        elif args.benchmark:
             print()
             print()
             print('Stats for the last frame:')
@@ -1206,26 +1206,26 @@ def print_maps(all_maps):
 if __name__ == '__main__':
     parse_args()
 
-    if yolact_args.config is not None:
-        set_cfg(yolact_args.config)
+    if args.config is not None:
+        set_cfg(args.config)
 
-    if yolact_args.trained_model == 'interrupt':
-        yolact_args.trained_model = SavePath.get_interrupt('weights/')
-    elif yolact_args.trained_model == 'latest':
-        yolact_args.trained_model = SavePath.get_latest('weights/', cfg.name)
+    if args.trained_model == 'interrupt':
+        args.trained_model = SavePath.get_interrupt('weights/')
+    elif args.trained_model == 'latest':
+        args.trained_model = SavePath.get_latest('weights/', cfg.name)
 
-    if yolact_args.config is None:
-        model_path = SavePath.from_str(yolact_args.trained_model)
+    if args.config is None:
+        model_path = SavePath.from_str(args.trained_model)
         # TODO: Bad practice? Probably want to do a name lookup instead.
-        yolact_args.config = model_path.model_name + '_config'
-        print('Config not specified. Parsed %s from the file name.\n' % yolact_args.config)
-        set_cfg(yolact_args.config)
+        args.config = model_path.model_name + '_config'
+        print('Config not specified. Parsed %s from the file name.\n' % args.config)
+        set_cfg(args.config)
 
-    if yolact_args.detect:
+    if args.detect:
         cfg.eval_mask_branch = False
 
-    if yolact_args.dataset is not None:
-        set_dataset(yolact_args.dataset)
+    if args.dataset is not None:
+        set_dataset(args.dataset)
 
     from utils.logging_helper import setup_logger
     setup_logger(logging_level=logging.INFO)
@@ -1235,23 +1235,23 @@ if __name__ == '__main__':
         if not os.path.exists('results'):
             os.makedirs('results')
 
-        if yolact_args.cuda:
+        if args.cuda:
             cudnn.benchmark = True
             cudnn.fastest = True
-            if yolact_args.deterministic:
+            if args.deterministic:
                 cudnn.deterministic = True
                 cudnn.benchmark = False
             torch.set_default_tensor_type('torch.cuda.FloatTensor')
         else:
             torch.set_default_tensor_type('torch.FloatTensor')
 
-        if yolact_args.resume and not yolact_args.display:
-            with open(yolact_args.ap_data_file, 'rb') as f:
+        if args.resume and not args.display:
+            with open(args.ap_data_file, 'rb') as f:
                 ap_data = pickle.load(f)
             calc_map(ap_data)
             exit()
 
-        if yolact_args.image is None and yolact_args.video is None and yolact_args.images is None:
+        if args.image is None and args.video is None and args.images is None:
             if cfg.dataset.name == 'YouTube VIS':
                 dataset = YoutubeVIS(image_path=cfg.dataset.valid_images,
                                          info_file=cfg.dataset.valid_info,
@@ -1266,16 +1266,16 @@ if __name__ == '__main__':
 
         logger.info('Loading model...')
         net = Yolact(training=False)
-        if yolact_args.trained_model is not None:
-            net.load_weights(yolact_args.trained_model, args=yolact_args)
+        if args.trained_model is not None:
+            net.load_weights(args.trained_model, args=args)
         else:
             logger.warning("No weights loaded!")
         net.eval()
         logger.info('Model loaded.')
 
-        convert_to_tensorrt(net, cfg, yolact_args, transform=BaseTransform())
+        convert_to_tensorrt(net, cfg, args, transform=BaseTransform())
 
-        if yolact_args.cuda:
+        if args.cuda:
             net = net.cuda()
 
         evaluate(net, dataset)
