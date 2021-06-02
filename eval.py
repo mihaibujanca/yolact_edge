@@ -42,6 +42,7 @@ def str2bool(v):
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description='YOLACT COCO Evaluation')
@@ -163,8 +164,11 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
         img_gpu = torch.Tensor(img_numpy).cuda()
     else:
         img_gpu = img / 255.0
-        h, w, _ = img.shape
-    
+        if h is None:
+            h = img.shape[0]
+        if w is None:
+            w = img.shape[1]
+
     with timer.env('Postprocess'):
         t = postprocess(dets_out, w, h, visualize_lincomb = args.display_lincomb,
                                         crop_masks        = args.crop,
@@ -192,7 +196,7 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
     def get_color(j, on_gpu=None):
         global color_cache
         color_idx = (classes[j] * 5 if class_color else j * 5) % len(COLORS)
-        
+
         if on_gpu is not None and color_idx in color_cache[on_gpu]:
             return color_cache[on_gpu][color_idx]
         else:
@@ -260,6 +264,40 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
                 cv2.putText(img_numpy, text_str, text_pt, font_face, font_scale, text_color, font_thickness, cv2.LINE_AA)
     
     return img_numpy, masks
+
+
+def get_labels_probs_numpy(dets_out, h, w):
+    with timer.env('Postprocess'):
+        t = postprocess(dets_out, w, h, visualize_lincomb=args.display_lincomb,
+                                        crop_masks       =args.crop,
+                                        score_threshold  =args.score_threshold)
+        torch.cuda.synchronize()
+
+    with timer.env('Copy'):
+        classes = t[0][:args.top_k].cpu().numpy()
+        scores = t[1][:args.top_k].cpu().numpy()
+        # masks = t[3][:args.top_k].cpu().numpy()
+        masks = t[3][:args.top_k]
+
+    num_dets_to_consider = min(args.top_k, classes.shape[0])
+    for j in range(num_dets_to_consider):
+        if scores[j] < args.score_threshold:
+            num_dets_to_consider = j
+            break
+        if classes[j] > 0:  # Annoyingly, in COCO 'person' is 0 rather than background. Makes life hard
+            masks[j] *= classes[j]  # Mark all positive pixels with their label
+
+    if num_dets_to_consider == 0:
+        # No detections found so just output the original image
+        return None, None
+    # 012
+    # 021
+    # 120
+    # 102
+    # 210
+    # 201
+    return masks[:num_dets_to_consider].permute(1, 2, 0).cpu().numpy().astype('uint8'), scores[:num_dets_to_consider]
+
 
 def prep_benchmark(dets_out, h, w):
     with timer.env('Postprocess'):

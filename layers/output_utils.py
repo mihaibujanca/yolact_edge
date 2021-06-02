@@ -136,9 +136,6 @@ def postprocess(det_output, w, h, batch_idx=0, interpolation_mode='bilinear',
     return classes, scores, boxes, masks
 
 
-    
-
-
 def undo_image_transformation(img, w, h):
     """
     Takes a transformed image tensor and returns a numpy ndarray that is untransformed.

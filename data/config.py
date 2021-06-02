@@ -45,14 +45,14 @@ COCO_CLASSES = ('person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
 
 COCO_LABEL_MAP = { 1:  1,  2:  2,  3:  3,  4:  4,  5:  5,  6:  6,  7:  7,  8:  8,
                    9:  9, 10: 10, 11: 11, 13: 12, 14: 13, 15: 14, 16: 15, 17: 16,
-                  18: 17, 19: 18, 20: 19, 21: 20, 22: 21, 23: 22, 24: 23, 25: 24,
-                  27: 25, 28: 26, 31: 27, 32: 28, 33: 29, 34: 30, 35: 31, 36: 32,
-                  37: 33, 38: 34, 39: 35, 40: 36, 41: 37, 42: 38, 43: 39, 44: 40,
-                  46: 41, 47: 42, 48: 43, 49: 44, 50: 45, 51: 46, 52: 47, 53: 48,
-                  54: 49, 55: 50, 56: 51, 57: 52, 58: 53, 59: 54, 60: 55, 61: 56,
-                  62: 57, 63: 58, 64: 59, 65: 60, 67: 61, 70: 62, 72: 63, 73: 64,
-                  74: 65, 75: 66, 76: 67, 77: 68, 78: 69, 79: 70, 80: 71, 81: 72,
-                  82: 73, 84: 74, 85: 75, 86: 76, 87: 77, 88: 78, 89: 79, 90: 80}
+                   18: 17, 19: 18, 20: 19, 21: 20, 22: 21, 23: 22, 24: 23, 25: 24,
+                   27: 25, 28: 26, 31: 27, 32: 28, 33: 29, 34: 30, 35: 31, 36: 32,
+                   37: 33, 38: 34, 39: 35, 40: 36, 41: 37, 42: 38, 43: 39, 44: 40,
+                   46: 41, 47: 42, 48: 43, 49: 44, 50: 45, 51: 46, 52: 47, 53: 48,
+                   54: 49, 55: 50, 56: 51, 57: 52, 58: 53, 59: 54, 60: 55, 61: 56,
+                   62: 57, 63: 58, 64: 59, 65: 60, 67: 61, 70: 62, 72: 63, 73: 64,
+                   74: 65, 75: 66, 76: 67, 77: 68, 78: 69, 79: 70, 80: 71, 81: 72,
+                   82: 73, 84: 74, 85: 75, 86: 76, 87: 77, 88: 78, 89: 79, 90: 80}
 
 YOUTUBE_VIS_CLASSES = ('person', 'giant_panda', 'lizard', 'parrot', 'skateboard',
                        'sedan', 'ape', 'dog', 'snake', 'monkey', 'hand', 'rabbit',
@@ -62,8 +62,8 @@ YOUTUBE_VIS_CLASSES = ('person', 'giant_panda', 'lizard', 'parrot', 'skateboard'
                        'elephant', 'snowboard', 'boat', 'shark', 'mouse', 'frog',
                        'eagle', 'earless_seal', 'tennis_racket')
 
-YOUTUBE_VIS_LABEL_MAP = { 1:  1,  2:  2,  3:  3,  4:  4,  5:  5,  6:  6,  7:  7,
-                          8:  8,  9:  9, 10: 10, 11: 11, 12: 12, 13: 13, 14: 14,
+YOUTUBE_VIS_LABEL_MAP = {1:  1,  2:  2,  3:  3,  4:  4,  5:  5,  6:  6,  7:  7,
+                         8:  8,  9:  9, 10: 10, 11: 11, 12: 12, 13: 13, 14: 14,
                          15: 15, 16: 16, 17: 17, 18: 18, 19: 19, 20: 20, 21: 21,
                          22: 22, 23: 23, 24: 24, 25: 25, 26: 26, 27: 27, 28: 28,
                          29: 29, 30: 30, 31: 31, 32: 32, 33: 33, 34: 34, 35: 35,
@@ -107,7 +107,7 @@ class Config(object):
         """
 
         ret = Config(vars(self))
-        
+
         for key, val in new_config_dict.items():
             ret.__setattr__(key, val)
 
@@ -123,17 +123,13 @@ class Config(object):
 
         for key, val in new_config_dict.items():
             self.__setattr__(key, val)
-    
+
     def print(self):
         for k, v in vars(self).items():
             print(k, ' = ', v)
 
 
-
-
-
 # ----------------------- DATASETS ----------------------- #
-
 dataset_base = Config({
     'name': 'Base Dataset',
 
@@ -143,7 +139,7 @@ dataset_base = Config({
 
     # Calibration image folder for TensorRT INT8 conversion.
     'calib_images': './data/coco/calib_images/',
-    
+
     # Validation images and annotations.
     'valid_images': './data/coco/images/',
     'valid_info':   'path_to_annotation_file',
@@ -171,7 +167,7 @@ dataset_base = Config({
 
 coco2014_dataset = dataset_base.copy({
     'name': 'COCO 2014',
-    
+
     'train_info': './data/coco/annotations/instances_train2014.json',
     'valid_info': './data/coco/annotations/instances_val2014.json',
 
@@ -180,7 +176,7 @@ coco2014_dataset = dataset_base.copy({
 
 coco2017_dataset = dataset_base.copy({
     'name': 'COCO 2017',
-    
+
     'train_info': './data/coco/annotations/instances_train2017.json',
     'valid_info': './data/coco/annotations/instances_val2017.json',
 
@@ -230,13 +226,7 @@ youtube_vis_dataset = dataset_base.copy({
     'is_video': True
 })
 
-
-
-
-
-
 # ----------------------- TRANSFORMS ----------------------- #
-
 resnet_transform = Config({
     'channel_order': 'RGB',
     'normalize': True,
@@ -267,10 +257,7 @@ mobilenetv2_transform = Config({
     'to_float': False,
 })
 
-
-
 # ----------------------- BACKBONES ----------------------- #
-
 backbone_base = Config({
     'name': 'Base Backbone',
     'path': 'path/to/pretrained/weights',
@@ -379,7 +366,7 @@ mobilenetv2_backbone = backbone_base.copy({
     'transform': mobilenetv2_transform,
 
     'selected_layers': [3, 4, 6],
-    
+
     'pred_aspect_ratios': [ [[1, 1/2, 2]] ]*5,
     'pred_scales': [[24], [48], [96], [192], [384]],
 
@@ -388,10 +375,7 @@ mobilenetv2_backbone = backbone_base.copy({
     'use_square_anchors': True,
 })
 
-
-
 # ----------------------- MASK BRANCH TYPES ----------------------- #
-
 mask_type = Config({
     # Direct produces masks directly as the output of each pred module.
     # This is denoted as fc-mask in the paper.
@@ -519,7 +503,7 @@ flow_base = Config({
 coco_base_config = Config({
     'dataset': coco2014_dataset,
     'joint_dataset': None,
-    'num_classes': 81, # This should include the background class
+    'num_classes': 81,  # This should include the background class
 
     'max_iter': 400000,
 
@@ -614,7 +598,7 @@ coco_base_config = Config({
     'use_focal_loss': False,
     'focal_loss_alpha': 0.25,
     'focal_loss_gamma': 2,
-    
+
     # The initial bias toward forground objects, as specified in the focal loss paper
     'focal_loss_init_pi': 0.01,
 
@@ -667,7 +651,7 @@ coco_base_config = Config({
     # Input image size. If preserve_aspect_ratio is False, min_size is ignored.
     'min_size': 200,
     'max_size': 300,
-    
+
     # Whether or not to do post processing on the cpu at test time
     'force_cpu_nms': True,
 
@@ -697,7 +681,7 @@ coco_base_config = Config({
 
     # Whether or not to use the predicted coordinate scheme from Yolo v2
     'use_yolo_regressors': False,
-    
+
     # For training, bboxes are considered "positive" if their anchors have a 0.5 IoU overlap
     # or greater with a ground truth box. If this is true, instead of using the anchor boxes
     # for this IoU computation, the matching function will use the predicted bbox coordinates.
@@ -715,12 +699,7 @@ coco_base_config = Config({
     'name': 'base_config',
 })
 
-
-
-
-
 # ----------------------- YOLACT v1.0 CONFIGS ----------------------- #
-
 yolact_base_config = coco_base_config.copy({
     'name': 'yolact_base',
 
@@ -730,14 +709,14 @@ yolact_base_config = coco_base_config.copy({
 
     # Image Size
     'max_size': 550,
-    
+
     # Training params
     'lr_schedule': 'step',
     'lr_steps': (280000, 600000, 700000, 750000),
     'max_iter': 800000,
 
     'flow': flow_base,
-    
+
     # Backbone Settings
     'backbone': resnet101_backbone.copy({
         'selected_layers': list(range(1, 4)),
@@ -954,4 +933,3 @@ def set_cfg(config_name:str):
 def set_dataset(dataset_name:str):
     """ Sets the dataset of the current config. """
     cfg.dataset = eval(dataset_name)
-    
